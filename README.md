@@ -480,7 +480,7 @@ Coverage includes:
 ## Postman
 
 1. Open Postman.
-2. `Import` → select `staysync.postman_collection.json`.
+2. `Import` → select `postman\staysync.postman_collection.json`.
 3. The collection defines a `{{baseUrl}}` variable (default `http://localhost:3000`); edit it in the collection's Variables tab if your API is elsewhere.
 
 The collection includes: normal aggregation, price filtering, no-result city, missing city, invalid price, invalid price range, health, both mock supplier endpoints, and supplier failure simulation. Restart the API with `SIMULATE_SUPPLIER_A_FAILURE=true` (or B) — see the Failure Handling section — to see the failure-simulation responses.

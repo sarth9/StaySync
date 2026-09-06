@@ -1,0 +1,318 @@
+{
+  "info": {
+    "name": "StaySync",
+    "_postman_id": "staysync",
+    "description": "StaySync - Hotel Offer Orchestrator.\n\nAggregates hotel offers from Supplier A and Supplier B via a Temporal workflow, deduplicates by name (cheapest wins, Supplier A wins ties), and serves results through a Redis sorted set with price filtering done inside Redis (ZRANGEBYSCORE).\n\nFailure semantics:\n- One supplier down  -> HTTP 200 with the healthy supplier's offers.\n- No results         -> HTTP 200 with an empty array [] (valid no-results case, e.g. chennai).\n- Both suppliers down -> workflow fails with a non-retryable ApplicationFailure -> HTTP 500 (generic error, no stack trace).\n\nConcurrency: concurrent aggregations for the same city are serialized by a per-city Redis lock; the Redis set is replaced atomically (DEL + ZADD in one MULTI/EXEC).\n\nTo exercise failure scenarios with Docker Compose, restart the api service with the flags:\n  SIMULATE_SUPPLIER_A_FAILURE=true\n  SIMULATE_SUPPLIER_B_FAILURE=true\nSet both to true to exercise the HTTP 500 path. Restore with docker compose up -d api (default false).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Aggregation",
+      "item": [
+        {
+          "name": "Normal aggregation",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [{ "key": "city", "value": "delhi" }]
+            },
+            "description": "Returns deduplicated hotel offers for Delhi. Hotels present in both suppliers return only the cheaper offer (Holtin and Radison come from Supplier B/A respectively)."
+          }
+        },
+        {
+          "name": "Price filtering",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=5000&maxPrice=6000",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [
+                { "key": "city", "value": "delhi" },
+                { "key": "minPrice", "value": "5000" },
+                { "key": "maxPrice", "value": "6000" }
+              ]
+            },
+            "description": "Filters hotels by price. Filtering is performed inside Redis via ZRANGEBYSCORE on a sorted set where the score is the price."
+          }
+        },
+        {
+          "name": "Open-ended price filter",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=5000",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [
+                { "key": "city", "value": "delhi" },
+                { "key": "minPrice", "value": "5000" }
+              ]
+            },
+            "description": "Omitting maxPrice applies an open upper bound (+inf) so every offer at or above minPrice is returned."
+          }
+        },
+        {
+          "name": "Case-insensitive city",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=deLhi",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [{ "key": "city", "value": "deLhi" }]
+            },
+            "description": "City matching and the Redis key are case-insensitive (delhi, Delhi, DELHI all resolve to the same offers and lock)."
+          }
+        },
+        {
+          "name": "City with no results",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=chennai",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [{ "key": "city", "value": "chennai" }]
+            },
+            "description": "Returns HTTP 200 with an empty array [] when both suppliers succeed but have no offers for the city. This is the valid no-results case - distinct from a failure."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Validation errors",
+      "item": [
+        {
+          "name": "Missing city",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": []
+            },
+            "description": "Returns HTTP 400 when the city query parameter is missing.",
+            "response": [{ "code": 400 }]
+          }
+        },
+        {
+          "name": "Invalid price",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=abc",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [
+                { "key": "city", "value": "delhi" },
+                { "key": "minPrice", "value": "abc" }
+              ]
+            },
+            "description": "Returns HTTP 400 when a price parameter is not a valid non-negative number.",
+            "response": [{ "code": 400 }]
+          }
+        },
+        {
+          "name": "Negative price",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=-50",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [
+                { "key": "city", "value": "delhi" },
+                { "key": "minPrice", "value": "-50" }
+              ]
+            },
+            "description": "Returns HTTP 400 when a price is negative.",
+            "response": [{ "code": 400 }]
+          }
+        },
+        {
+          "name": "Inverted price range",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=7000&maxPrice=5000",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [
+                { "key": "city", "value": "delhi" },
+                { "key": "minPrice", "value": "7000" },
+                { "key": "maxPrice", "value": "5000" }
+              ]
+            },
+            "description": "Returns HTTP 400 when minPrice is greater than maxPrice.",
+            "response": [{ "code": 400 }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Failure scenarios",
+      "item": [
+        {
+          "name": "Single supplier failure (A down)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [{ "key": "city", "value": "delhi" }]
+            },
+            "description": "Prerequisite: run `SIMULATE_SUPPLIER_A_FAILURE=true docker compose up -d api`.\n\nSupplier A returns HTTP 503, so the workflow uses only Supplier B's offers. Expect HTTP 200 with Supplier B-only data (5 hotels for Delhi)."
+          }
+        },
+        {
+          "name": "Single supplier failure (B down)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [{ "key": "city", "value": "delhi" }]
+            },
+            "description": "Prerequisite: run `SIMULATE_SUPPLIER_B_FAILURE=true docker compose up -d api`.\n\nSupplier B returns HTTP 503, so the workflow uses only Supplier A's offers. Expect HTTP 200 with Supplier A continued data."
+          }
+        },
+        {
+          "name": "Both suppliers fail",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [{ "key": "city", "value": "delhi" }]
+            },
+            "description": "Prerequisite: run `SIMULATE_SUPPLIER_A_FAILURE=true SIMULATE_SUPPLIER_B_FAILURE=true docker compose up -d api`.\n\nBoth supplier calls fail after retries. The workflow fails with a non-retryable ApplicationFailure and the API returns HTTP 500 with a generic { \"error\": \"Internal server error\" } - never confused with the valid no-results case ([]).",
+            "response": [{ "code": 500 }]
+          }
+        },
+        {
+          "name": "Health while a supplier is down",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "With one or both SIMULATE_*_FAILURE flags enabled, expect HTTP 503 with status degraded and the simulated supplier(s) reported as unhealthy.",
+            "response": [{ "code": 503 }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health (all healthy)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "Returns HTTP 200 with overall status ok and per-service health for app, Supplier A, Supplier B, Redis, and Temporal.",
+            "response": [{ "code": 200 }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Suppliers (direct)",
+      "item": [
+        {
+          "name": "Supplier A",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/supplierA/hotels?city=delhi",
+              "host": ["{{baseUrl}}"],
+              "path": ["supplierA", "hotels"],
+              "query": [{ "key": "city", "value": "delhi" }]
+            },
+            "description": "Mock Supplier A endpoint. Returns Supplier A's static hotel dataset filtered by city."
+          }
+        },
+        {
+          "name": "Supplier B",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/supplierB/hotels?city=delhi",
+              "host": ["{{baseUrl}}"],
+              "path": ["supplierB", "hotels"],
+              "query": [{ "key": "city", "value": "delhi" }]
+            },
+            "description": "Mock Supplier B endpoint. Returns Supplier B's static hotel dataset filtered by city."
+          }
+        },
+        {
+          "name": "Supplier A - missing city",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/supplierA/hotels",
+              "host": ["{{baseUrl}}"],
+              "path": ["supplierA", "hotels"],
+              "query": []
+            },
+            "description": "Returns HTTP 400 when the city query parameter is missing.",
+            "response": [{ "code": 400 }]
+          }
+        },
+        {
+          "name": "Supplier B - missing city",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/supplierB/hotels",
+              "host": ["{{baseUrl}}"],
+              "path": ["supplierB", "hotels"],
+              "query": []
+            },
+            "description": "Returns HTTP 400 when the city query parameter is missing.",
+            "response": [{ "code": 400 }]
+          }
+        }
+      ]
+    }
+  ]
+}
