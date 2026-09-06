@@ -1,0 +1,187 @@
+{
+  "info": {
+    "name": "StaySync",
+    "_postman_id": "staysync",
+    "description": "StaySync - Hotel Offer Orchestrator. Aggregates hotel offers from Supplier A and Supplier B via a Temporal workflow, deduplicates by name, picks the cheapest offer, and serves results through Redis with price filtering.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Normal aggregation",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/hotels?city=delhi",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "hotels"],
+          "query": [{ "key": "city", "value": "delhi" }]
+        },
+        "description": "Returns deduplicated hotel offers for Delhi. Hotels present in both suppliers return only the cheaper offer."
+      }
+    },
+    {
+      "name": "Price filtering",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=5000&maxPrice=6000",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "hotels"],
+          "query": [
+            { "key": "city", "value": "delhi" },
+            { "key": "minPrice", "value": "5000" },
+            { "key": "maxPrice", "value": "6000" }
+          ]
+        },
+        "description": "Filters hotels by price. Filtering is performed inside Redis using a sorted set score range query (ZRANGEBYSCORE)."
+      }
+    },
+    {
+      "name": "City with no results",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/hotels?city=chennai",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "hotels"],
+          "query": [{ "key": "city", "value": "chennai" }]
+        },
+        "description": "Returns an empty array when no supplier has offers for the requested city."
+      }
+    },
+    {
+      "name": "Missing city",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/hotels",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "hotels"],
+          "query": []
+        },
+        "description": "Returns HTTP 400 when the city query parameter is missing.",
+        "response": [{ "code": 400 }]
+      }
+    },
+    {
+      "name": "Invalid price",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=abc",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "hotels"],
+          "query": [
+            { "key": "city", "value": "delhi" },
+            { "key": "minPrice", "value": "abc" }
+          ]
+        },
+        "description": "Returns HTTP 400 when a price parameter is not a valid non-negative number.",
+        "response": [{ "code": 400 }]
+      }
+    },
+    {
+      "name": "Invalid price range",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=7000&maxPrice=5000",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "hotels"],
+          "query": [
+            { "key": "city", "value": "delhi" },
+            { "key": "minPrice", "value": "7000" },
+            { "key": "maxPrice", "value": "5000" }
+          ]
+        },
+        "description": "Returns HTTP 400 when minPrice is greater than maxPrice.",
+        "response": [{ "code": 400 }]
+      }
+    },
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["health"]
+        },
+        "description": "Returns the overall status plus per-service health for app, Supplier A, Supplier B, Redis, and Temporal. Returns 503 when any dependency is unhealthy.",
+        "response": [{ "code": 200 }]
+      }
+    },
+    {
+      "name": "Supplier A",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/supplierA/hotels?city=delhi",
+          "host": ["{{baseUrl}}"],
+          "path": ["supplierA", "hotels"],
+          "query": [{ "key": "city", "value": "delhi" }]
+        },
+        "description": "Mock Supplier A endpoint. Returns Supplier A's static hotel dataset filtered by city."
+      }
+    },
+    {
+      "name": "Supplier B",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/supplierB/hotels?city=delhi",
+          "host": ["{{baseUrl}}"],
+          "path": ["supplierB", "hotels"],
+          "query": [{ "key": "city", "value": "delhi" }]
+        },
+        "description": "Mock Supplier B endpoint. Returns Supplier B's static hotel dataset filtered by city."
+      }
+    },
+    {
+      "name": "Supplier A failure simulation",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/supplierA/hotels?city=delhi",
+          "host": ["{{baseUrl}}"],
+          "path": ["supplierA", "hotels"],
+          "query": [{ "key": "city", "value": "delhi" }]
+        },
+        "description": "When SIMULATE_SUPPLIER_A_FAILURE=true, Supplier A returns HTTP 503. The aggregation workflow then still returns Supplier B's offers.",
+        "response": [{ "code": 503 }]
+      }
+    },
+    {
+      "name": "Supplier B failure simulation",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/supplierB/hotels?city=delhi",
+          "host": ["{{baseUrl}}"],
+          "path": ["supplierB", "hotels"],
+          "query": [{ "key": "city", "value": "delhi" }]
+        },
+        "description": "When SIMULATE_SUPPLIER_B_FAILURE=true, Supplier B returns HTTP 503. The aggregation workflow then still returns Supplier A's offers.",
+        "response": [{ "code": 503 }]
+      }
+    }
+  ]
+}
