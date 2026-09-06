@@ -28,6 +28,11 @@ export interface HotelWorkflowInput {
   maxPrice?: number;
 }
 
+export interface SupplierFetchResult {
+  hotels: HotelOffer[];
+  failed: boolean;
+}
+
 export interface HotelWorkflowResult {
   hotels: HotelResult[];
 }

@@ -1,12 +1,22 @@
-import { proxyActivities } from "@temporalio/workflow";
-import { HotelOffer, HotelWorkflowInput, HotelWorkflowResult, AggregatedHotelResult } from "../../types/hotel";
-import { deduplicateAndSelectBestOffers } from "../../services/hotel.service";
+import { proxyActivities, ApplicationFailure } from "@temporalio/workflow";
+import {
+  HotelOffer,
+  HotelWorkflowInput,
+  HotelWorkflowResult,
+  AggregatedHotelResult,
+  SupplierFetchResult,
+} from "../../types/hotel";
+import { combineSupplierResults } from "../../services/hotel.service";
 
 interface SupplierActivities {
   fetchSupplierA(city: string): Promise<HotelOffer[]>;
   fetchSupplierB(city: string): Promise<HotelOffer[]>;
-  saveHotelsToRedis(city: string, offers: AggregatedHotelResult[]): Promise<void>;
-  queryHotelsFromRedis(city: string, minPrice?: number, maxPrice?: number): Promise<HotelWorkflowResult["hotels"]>;
+  refreshAndQueryHotels(
+    city: string,
+    offers: AggregatedHotelResult[],
+    minPrice?: number,
+    maxPrice?: number
+  ): Promise<HotelWorkflowResult["hotels"]>;
 }
 
 const activities = proxyActivities<SupplierActivities>({
@@ -18,45 +28,61 @@ const activities = proxyActivities<SupplierActivities>({
   },
 });
 
-async function fetchWithFallback(
+async function fetchSupplier(
   promise: Promise<HotelOffer[]>,
   supplierName: string,
   city: string
-): Promise<HotelOffer[]> {
+): Promise<SupplierFetchResult> {
   try {
-    return await promise;
+    const hotels = await promise;
+    return { hotels, failed: false };
   } catch (error) {
-    console.log(`[Workflow] Supplier ${supplierName} failed for city ${city}: ${(error as Error).message}. Continue with empty offers.`);
-    return [];
+    console.log(
+      `[Workflow] Supplier ${supplierName} failed for city ${city}: ${(error as Error).message}. Will continue without it.`
+    );
+    return { hotels: [], failed: true };
   }
 }
 
 async function hotelAggregationWorkflow(input: HotelWorkflowInput): Promise<HotelWorkflowResult> {
-  const city = input.city;
+  const city = input.city?.trim() ?? "";
   const { minPrice, maxPrice } = input;
 
-  if (!city || city.trim() === "") {
+  if (!city || city === "") {
     throw new Error("city is required");
   }
 
   console.log(`[Workflow] Started hotel aggregation for city: ${city}`);
 
   // Supplier A and Supplier B calls run in parallel.
-  // Each is guarded so one failing supplier does not block offers from the other.
-  const [supplierAOffers, supplierBOffers] = await Promise.all([
-    fetchWithFallback(activities.fetchSupplierA(city), "A", city),
-    fetchWithFallback(activities.fetchSupplierB(city), "B", city),
+  // Each failure is captured (hotels=[], failed=true) so one failing supplier does
+  // not block offers from the other. `failed=true` is distinct from a successful
+  // empty result (hotels=[], failed=false).
+  const [supplierA, supplierB] = await Promise.all([
+    fetchSupplier(activities.fetchSupplierA(city), "A", city),
+    fetchSupplier(activities.fetchSupplierB(city), "B", city),
   ]);
 
-  // Deduplicate by name (cheapest wins, Supplier A wins ties)
-  const allOffers = deduplicateAndSelectBestOffers(supplierAOffers, supplierBOffers);
+  // Deduplicate by name (cheapest wins, Supplier A wins ties).
+  // Throws only when BOTH suppliers failed -> the workflow fails -> API returns HTTP 500.
+  // "Both suppliers succeeded with zero hotels" is a valid result and yields [].
+  // The `ApplicationFailure` (nonRetryable) terminates the workflow execution so
+  // `handle.result()` rejects promptly instead of retrying the workflow task on
+  // the server.
+  let allOffers: AggregatedHotelResult[];
+  try {
+    allOffers = combineSupplierResults(supplierA, supplierB, city);
+  } catch (error) {
+    throw ApplicationFailure.nonRetryable(
+      error instanceof Error ? error.message : "Both suppliers failed; aggregation cannot proceed",
+      "BothSuppliersFailed"
+    );
+  }
   console.log(`[Workflow] Deduplication produced ${allOffers.length} unique hotels for ${city}`);
 
-  // Save deduplicated results to Redis (overwrites stale data)
-  await activities.saveHotelsToRedis(city, allOffers);
-
-  // Query from Redis with optional price filtering (filtering happens inside Redis)
-  const filteredHotels = await activities.queryHotelsFromRedis(city, minPrice, maxPrice);
+  // Save deduplicated results to Redis and query them back under a per-city lock.
+  // DEL + ZADD are applied in one atomic transaction; price filtering happens inside Redis.
+  const filteredHotels = await activities.refreshAndQueryHotels(city, allOffers, minPrice, maxPrice);
   console.log(`[Workflow] Completed: ${filteredHotels.length} hotels returned for ${city}`);
 
   return { hotels: filteredHotels };

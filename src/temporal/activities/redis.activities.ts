@@ -1,28 +1,18 @@
 import { AggregatedHotelResult, HotelResult } from "../../types/hotel";
 import { logger } from "../../utils/logger";
-import { createRedisClient, saveHotels, queryHotels } from "../../services/redis.service";
+import { createRedisClient, saveAndQueryHotels } from "../../services/redis.service";
 
-export async function saveHotelsToRedis(city: string, offers: AggregatedHotelResult[]): Promise<void> {
-  const redis = createRedisClient();
-  try {
-    logger.info(`[Activity] Saving ${offers.length} hotels to Redis for city ${city}`);
-    await saveHotels(redis, city, offers);
-    logger.info(`[Activity] Redis write completed for city ${city}`);
-  } finally {
-    redis.disconnect();
-  }
-}
-
-export async function queryHotelsFromRedis(
+export async function refreshAndQueryHotels(
   city: string,
+  offers: AggregatedHotelResult[],
   minPrice?: number,
   maxPrice?: number
 ): Promise<HotelResult[]> {
   const redis = createRedisClient();
   try {
-    const priceRange = minPrice !== undefined || maxPrice !== undefined ? ` [${minPrice ?? "-inf"}, ${maxPrice ?? "+inf"}]` : " (all)";
-    logger.info(`[Activity] Redis query for city ${city}${priceRange}`);
-    const hotels = await queryHotels(redis, city, minPrice, maxPrice);
+    const range = minPrice !== undefined || maxPrice !== undefined ? ` [${minPrice ?? "-inf"}, ${maxPrice ?? "+inf"}]` : " (all)";
+    logger.info(`[Activity] Refreshing Redis set for city ${city} with ${offers.length} hotels${range}`);
+    const hotels = await saveAndQueryHotels(redis, city, offers, minPrice, maxPrice);
     logger.info(`[Activity] Redis query returned ${hotels.length} hotels`);
     return hotels;
   } finally {

@@ -67,14 +67,15 @@ Example response for `GET /api/hotels?city=delhi`:
 - **Temporal orchestration** — a real Temporal workflow that calls both suppliers concurrently as activities.
 - **Deduplication** — hotels appearing in both suppliers are merged by `name`; the cheaper price wins.
 - **Deterministic tie-breaker** — on equal prices **Supplier A** wins.
-- **Supplier failure resilience** — if one supplier fails after retries, the workflow still returns the healthy supplier's offers.
+- **Supplier failure resilience** — if one supplier fails after retries, the workflow still returns the healthy supplier's offers; if **both** suppliers fail, the workflow fails and the API returns HTTP 500.
 - **Redis persistence** — deduplicated results are stored in a Redis Sorted Set keyed by `hotels:{city}` with `score = price`.
 - **Redis-native price filtering** — price ranges are applied with `ZRANGEBYSCORE`; no Node-side filtering.
-- **Stale-data safety** — the sorted set key is deleted before each write, so repeated executions never accumulate duplicate/stale entries.
+- **Stale-data safety** — each write replaces the key via an atomic `DEL` + `ZADD` transaction, so readers never observe a torn/empty set and repeated executions never accumulate duplicate/stale entries.
+- **Same-city concurrency safety** — concurrent aggregations for one city are serialized by a small city-scoped Redis lock (see "Concurrency" below).
 - **Mock suppliers** — two in-app endpoints (`/supplierA/hotels`, `/supplierB/hotels`) with overlapping datasets.
 - **Validation** — rejects missing city, invalid/negative prices, and inverted price ranges with HTTP 400.
 - **Centralized error handling** — consistent `{ "error": "..." }` shapes, no stack traces leaked.
-- **Logging** — Winston-based logs for requests, workflow lifecycle, supplier calls, dedup, Redis writes/queries, and errors (including request method/path/status/duration).
+- **Logging** — Winston-based logs for the API and Temporal activities (request method/path/status/duration, supplier calls, dedup, Redis writes/queries, errors). Workflow code itself is deterministic and uses Temporal-safe `console.log` (mapped to the worker logger); Winston is **not** imported into workflow code.
 - **Health checks** — `/health` performs lightweight live checks against Redis, Temporal, and both suppliers, summarized under a `services` map.
 - **Docker Compose** — one command brings up the API, worker, Redis, Temporal server, and Temporal UI.
 - **Testing** — Jest unit + API tests covering dedup, tie-breaking, Redis range behavior, and HTTP validation.
@@ -366,19 +367,31 @@ Score: 5340
 Member: {"name":"Holtin","price":5340,"supplier":"Supplier B","commissionPct":20,"originalId":"b1","city":"delhi"}
 ```
 
-**Write path** (Temporal activity `saveHotelsToRedis`):
+**Write + query path** (Temporal activity `refreshAndQueryHotels`):
 
-1. `DEL hotels:{city}` — removes any stale set from a previous execution.
-2. `ZADD` each deduplicated offer in a transaction (pipeline).
-
-**Query path** (Temporal activity `queryHotelsFromRedis`):
-
-- No price range → `ZRANGE hotels:{city} 0 -1`
-- With price range → `ZRANGEBYSCORE hotels:{city} <min> <max>`, using `-inf` / `+inf` for open bounds.
+1. Acquire the per-city lock `lock:hotels:{city}` (see below).
+2. `DEL hotels:{city}` + `ZADD` each deduplicated offer in one `MULTI`/`EXEC` transaction — the replacement is atomic, so a concurrent reader can never observe an empty or partial set.
+3. Query the freshly written set under the same lock:
+   - No price range → `ZRANGE hotels:{city} 0 -1`
+   - With price range → `ZRANGEBYSCORE hotels:{city} <min> <max>`, using `-inf` / `+inf` for open bounds.
+4. Release the lock.
 
 Because the score is the price, `ZRANGEBYSCORE` performs filtering entirely inside Redis. No hotel list is read into Node.js and filtered in JavaScript.
 
 Note: Redis returns range results ordered by score ascending. The API intentionally returns them in that order; see Assumptions.
+
+### Concurrency (same-city aggregations)
+
+Each workflow run still gets its own unique Temporal workflow ID (so every request always runs a fresh aggregation and receives its own correctly-filtered result). To stop two simultaneous aggregations for the **same city** from corrupting or interfering with each other's Redis result, the full write-then-read step is serialized per city with a small, well-contained Redis lock:
+
+- **Lock key:** `lock:hotels:{city}` (city lowercased — `delhi`, `Delhi`, `DELHI` share one lock).
+- **Acquisition:** atomic `SET lock:hotels:delhi <token> PX 5000 NX`.
+- **Token:** a unique UUID per operation; the lock is only ever released by the operation that acquired it.
+- **Release:** an atomic Lua compare-and-delete (`GET` == token → `DEL`), so a stale owner can never free someone else's lock.
+- **TTL:** 5s, so a crashed worker cannot hold the lock forever.
+- **Contention:** a short bounded poll loop (up to 2s) waits for the lock; the activity retry policy is a further backstop.
+
+This is intentionally **not** a claim that Redis writes are globally atomic — only that a single city's write+query is serialized and the sorted-set replacement itself is a single atomic transaction.
 
 ---
 
@@ -389,8 +402,7 @@ Note: Redis returns range results ordered by score ascending. The API intentiona
 - **Activities:**
   - `fetchSupplierA(city)` — HTTP GET to the Supplier A mock.
   - `fetchSupplierB(city)` — HTTP GET to the Supplier B mock.
-  - `saveHotelsToRedis(city, offers)` — sorted-set write.
-  - `queryHotelsFromRedis(city, minPrice?, maxPrice?)` — sorted-set range query.
+  - `refreshAndQueryHotels(city, offers, minPrice?, maxPrice?)` — atomic sorted-set write + range query under a per-city lock.
 
 **Concurrency & determinism:**
 
@@ -404,21 +416,24 @@ Note: Redis returns range results ordered by score ascending. The API intentiona
 
 ## Failure Handling
 
-**Partial supplier failure:**
-
-Each supplier call is wrapped so that a failure does not abort the workflow:
+Each supplier fetch produces a structured result (`{ hotels, failed }`), so a **failure** is distinct from a **successful empty response**. The supplier calls still run concurrently, and Temporal retries are preserved.
 
 ```ts
-try {
-  return await promise;
-} catch (error) {
-  // log + return []
-}
+type SupplierFetchResult = { hotels: HotelOffer[]; failed: boolean };
 ```
 
-Both activities still run concurrently. If Supplier A is down after its retries, the workflow logs the failure, uses an empty Supplier A result, and still returns Supplier B's valid offers (and vice versa). A total failure (both suppliers down, or Redis unavailable) surfaces as an HTTP 500.
+Behavior:
 
-To exercise this live, restart the `api` service with `SIMULATE_SUPPLIER_A_FAILURE=true` (or B) and call `/api/hotels` — the healthy supplier's offers are still returned (`/health` also reports the simulated supplier as `unhealthy`). With Docker Compose the flag is interpolated, so:
+| Scenario                                        | Result |
+| ----------------------------------------------- | ------ |
+| Supplier A fails, Supplier B succeeds           | → HTTP 200, Supplier B offers |
+| Supplier B fails, Supplier A succeeds           | → HTTP 200, Supplier A offers |
+| Both suppliers succeed but return zero hotels   | → HTTP 200, `[]` (valid no-results case) |
+| **Both suppliers fail**                         | → workflow throws, **HTTP 500** |
+
+The "both suppliers fail" case is never confused with "no hotels" — it is an infrastructure/dependency failure and surfaces as HTTP 500 through the existing centralized error handler (a generic `{ "error": "Internal server error" }` with no stack-trace leakage). The workflow throws a **non-retryable** `ApplicationFailure` for this case, so the judgment is deliberately outside of Temporal activity retries — it is the *workflow execution* that fails, and `handle.result()` rejects promptly (a plain `Error` would let the Temporal server keep retrying the workflow task with backoff).
+
+To exercise partial failure live, restart the `api` service with `SIMULATE_SUPPLIER_A_FAILURE=true` (or B) and call `/api/hotels` — the healthy supplier's offers are still returned (`/health` also reports the simulated supplier as `unhealthy`). Setting **both** simulation flags to `true` exercises the HTTP 500 path. With Docker Compose the flags are interpolated, so:
 
 ```bash
 # Linux/macOS
@@ -450,7 +465,9 @@ Coverage includes:
 - **Single-supplier offers:** Supplier A-only and Supplier B-only hotels are retained.
 - **Tie-breaking:** Supplier A wins on equal prices.
 - **Empty results:** both suppliers empty → `[]`.
-- **Redis behavior:** `DEL` before write, `score = price`, lowercased keys, `ZRANGEBYSCORE` for ranges, `-inf`/`+inf` open bounds.
+- **Supplier failure semantics:** A fails / B succeeds → uses B; B fails / A succeeds → uses A; both fail → throws (HTTP 500); both succeed with zero hotels → valid `[]`.
+- **Redis behavior:** `DEL` + `ZADD` issued in one transaction (`score = price`, lowercased keys), `ZRANGEBYSCORE` for ranges, `-inf`/`+inf` open bounds.
+- **Per-city lock:** atomic NX acquisition with a unique token, token-guarded release, poll-and-retry while contended, timeout if never released, and save+query executed under the lock.
 - **Health summary:** `ok` / `degraded` / `down` aggregation logic.
 - **HTTP validation:** missing city, invalid/negative prices, inverted range → `400`; success → `200`; unexpected failure → `500` (no stack leak).
 - **Health endpoint:** `200` when healthy, `503` with `degraded` status when a dependency is down.
@@ -474,8 +491,8 @@ The collection includes: normal aggregation, price filtering, no-result city, mi
 
 - **Tie-breaker:** when both suppliers quote the same price, **Supplier A wins** (deterministic, documented, and unit-tested).
 - **Ordering:** Redis `ZRANGE`/`ZRANGEBYSCORE` return members ordered by score ascending; the API returns that order without additional sorting. (A stable, documented ordering avoids non-determinism.)
-- **Supplier failure semantics:** a supplier that fails after retries is treated as returning zero offers rather than failing the whole request; at least one working supplier is needed for a successful response.
-- **Cities are case-insensitive** for both lookup and the Redis key.
+- **Supplier failure semantics:** a supplier that fails after retries is treated as "no offers, failed = true". If only one supplier fails, the healthy supplier's offers are used. If **both** fail, the workflow fails and the API returns HTTP 500 (never confused with a successful empty result).
+- **Cities are case-insensitive** for both lookup and the Redis key (and for the per-city lock).
 - **Redis key hygiene:** each workflow execution deletes and rewrites `hotels:{city}`, guaranteeing the set matches the latest aggregation (no stale or duplicated members).
 - **Mock suppliers are served in-process** by the Express application; the worker reaches them through `SUPPLIER_A_URL`/`SUPPLIER_B_URL` over the Compose network.
 - **Temporal dev server** uses SQLite (in-memory) persistence for this assignment; swap in Postgres/MySQL + Elasticsearch for durable production deployments.
